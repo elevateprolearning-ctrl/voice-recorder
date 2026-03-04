@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voice Recorder (Local Playback)</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    .card { max-width: 720px; padding: 18px; border: 1px solid #ccc; border-radius: 12px; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; }
+    button {
+      padding: 10px 14px; border-radius: 10px; border: 1px solid #999; cursor: pointer;
+      font-size: 14px; background: transparent;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .pill { padding: 6px 10px; border-radius: 999px; border: 1px solid #999; font-size: 12px; }
+    .status { font-weight: 600; }
+    .timer { font-variant-numeric: tabular-nums; }
+    .hint { font-size: 13px; opacity: .85; line-height: 1.4; }
+    audio { width: 100%; margin-top: 10px; }
+    .danger { color: #b00020; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Voice Recorder</h1>
+
+    <div class="row">
+      <span class="pill status" id="status">Idle</span>
+      <span class="pill timer" id="timer">00:00</span>
+      <span class="pill" id="formatPill">Format: —</span>
+    </div>
+
+    <div class="row">
+      <button id="btnRecord">🎙️ Record</button>
+      <button id="btnStop" disabled>⏹ Stop</button>
+      <button id="btnClear" disabled>🧹 Clear</button>
+      <a id="downloadLink" style="display:none" download>⬇️ Download recording</a>
+    </div>
+
+    <div class="hint">
+      Tip: This runs entirely in the browser (no upload). Microphone access usually requires <b>HTTPS</b>.
+      If you embed this in Rise via an iframe, the browser will ask the learner for mic permission.
+    </div>
+
+    <audio id="player" controls style="display:none"></audio>
+    <div id="error" class="hint danger" style="display:none; margin-top:10px;"></div>
+  </div>
+
+  <script>
+    // ---- Simple local voice recorder (MediaRecorder) ----
+    const statusEl = document.getElementById('status');
+    const timerEl = document.getElementById('timer');
+    const formatPill = document.getElementById('formatPill');
+    const btnRecord = document.getElementById('btnRecord');
+    const btnStop = document.getElementById('btnStop');
+    const btnClear = document.getElementById('btnClear');
+    const player = document.getElementById('player');
+    const errorEl = document.getElementById('error');
+    const downloadLink = document.getElementById('downloadLink');
+
+    let stream = null;
+    let recorder = null;
+    let chunks = [];
+    let blobUrl = null;
+
+    let timer = null;
+    let startTs = null;
+
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.style.display = 'block';
+    }
+    function clearError() {
+      errorEl.textContent = '';
+      errorEl.style.display = 'none';
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function fmtTime(ms) {
+      const totalSec = Math.floor(ms / 1000);
+      const m = String(Math.floor(totalSec / 60)).padStart(2, '0');
+      const s = String(totalSec % 60).padStart(2, '0');
+      return `${m}:${s}`;
+    }
+
+    function startTimer() {
+      startTs = Date.now();
+      timerEl.textContent = '00:00';
+      timer = setInterval(() => {
+        timerEl.textContent = fmtTime(Date.now() - startTs);
+      }, 200);
+    }
+
+    function stopTimer() {
+      if (timer) clearInterval(timer);
+      timer = null;
+    }
+
+    function pickMimeType() {
+      // Prefer widely supported types. Browser decides actual codec support.
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',          // Safari sometimes supports mp4/aac
+        'audio/ogg;codecs=opus',
+        'audio/ogg'
+      ];
+      for (const t of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+      }
+      return ''; // let the browser choose
+    }
+
+    async function ensureStream() {
+      if (stream) return stream;
+      // Ask for mic permission
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      return stream;
+    }
+
+    function resetPlayback() {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      blobUrl = null;
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+      player.style.display = 'none';
+      downloadLink.style.display = 'none';
+      downloadLink.removeAttribute('href');
+      btnClear.disabled = true;
+    }
+
+    async function startRecording() {
+      clearError();
+      if (!navigator.mediaDevices?.getUserMedia) {
+        showError('Your browser does not support microphone recording (getUserMedia). Try Chrome or Edge.');
+        return;
+      }
+      if (!window.MediaRecorder) {
+        showError('MediaRecorder is not available in this browser. Try Chrome or Edge.');
+        return;
+      }
+
+      resetPlayback();
+      chunks = [];
+
+      try {
+        const s = await ensureStream();
+        const mimeType = pickMimeType();
+        recorder = new MediaRecorder(s, mimeType ? { mimeType } : undefined);
+
+        formatPill.textContent = 'Format: ' + (recorder.mimeType || (mimeType || 'default'));
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+        recorder.onerror = (e) => {
+          showError('Recording error: ' + (e?.error?.message || 'Unknown error'));
+        };
+        recorder.onstop = () => {
+          stopTimer();
+          setStatus('Recorded');
+          btnRecord.disabled = false;
+          btnStop.disabled = true;
+
+          const type = recorder.mimeType || chunks[0]?.type || 'audio/webm';
+          const blob = new Blob(chunks, { type });
+          blobUrl = URL.createObjectURL(blob);
+
+          player.src = blobUrl;
+          player.style.display = 'block';
+
+          // Download link
+          const ext =
+            type.includes('mp4') ? 'm4a' :
+            type.includes('ogg') ? 'ogg' :
+            'webm';
+          downloadLink.href = blobUrl;
+          downloadLink.download = `recording.${ext}`;
+          downloadLink.style.display = 'inline-block';
+
+          btnClear.disabled = false;
+        };
+
+        recorder.start(); // optionally pass timeslice for chunking
+        setStatus('Recording…');
+        btnRecord.disabled = true;
+        btnStop.disabled = false;
+        btnClear.disabled = true;
+        startTimer();
+
+      } catch (err) {
+        const msg = err?.name === 'NotAllowedError'
+          ? 'Microphone permission was denied. Please allow access and try again.'
+          : err?.name === 'NotFoundError'
+            ? 'No microphone was found on this device.'
+            : ('Could not start recording: ' + (err?.message || String(err)));
+
+        showError(msg);
+        setStatus('Idle');
+        btnRecord.disabled = false;
+        btnStop.disabled = true;
+      }
+    }
+
+    function stopRecording() {
+      clearError();
+      if (recorder && recorder.state === 'recording') {
+        recorder.stop();
+        setStatus('Stopping…');
+      }
+    }
+
+    function clearAll() {
+      clearError();
+      setStatus('Idle');
+      timerEl.textContent = '00:00';
+      formatPill.textContent = 'Format: —';
+      resetPlayback();
+    }
+
+    // Hook up UI
+    btnRecord.addEventListener('click', startRecording);
+    btnStop.addEventListener('click', stopRecording);
+    btnClear.addEventListener('click', clearAll);
+
+    // Safety: stop tracks on unload
+    window.addEventListener('beforeunload', () => {
+      try {
+        if (recorder && recorder.state === 'recording') recorder.stop();
+        if (stream) stream.getTracks().forEach(t => t.stop());
+      } catch {}
+    });
+
+    // If embedded in an iframe, some browsers require user gesture within the iframe.
+    // The Record button provides that gesture.
+  </script>
+
+  <!-- Notes:
+    - Host this file over HTTPS.
+    - To embed in Rise: add an Embed block and paste the hosted URL.
+    - If your host sets restrictive headers like X-Frame-Options or CSP frame-ancestors,
+      the iframe may be blocked. Configure hosting to allow embedding.
+  -->
+</body>
+</html>
